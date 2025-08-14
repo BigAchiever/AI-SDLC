@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react'; // Import useRef
 import { initializeApp } from 'firebase/app';
+import mammoth from 'mammoth';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
 import { getFirestore} from 'firebase/firestore';
 import { X, RotateCcw } from 'lucide-react';
@@ -1249,133 +1250,240 @@ ${steps.map((step, idx) => {
 
     // New handler for document file selection
     const handleDocumentFileChange = async (event) => {
-        let currentPromptContent = "";
-        let sourcePrimaryText = "";
-        let sourceOtherText = "";
         const file = event.target.files[0];
         if (file) {
+            // Check file type
+            const validTypes = [
+                'text/plain',
+                'text/markdown',
+                'text/html',
+                'application/json',
+                'application/msword',
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            ];
+            
+            const fileExtension = file.name.toLowerCase().split('.').pop();
+            const isWordDoc = fileExtension === 'doc' || fileExtension === 'docx' || 
+                            file.type.includes('msword') || file.type.includes('openxmlformats');
+            
+            if (!validTypes.includes(file.type) && !file.name.endsWith('.txt') && 
+                !file.name.endsWith('.md') && !isWordDoc) {
+                openModal('Please upload a valid text document (TXT, MD, DOC, DOCX, HTML).', 'info');
+                event.target.value = null;
+                return;
+            }
+            
             const newFile = {
-                id: Date.now() + Math.random(), // Unique ID
+                id: Date.now() + Math.random(),
                 name: file.name,
                 type: 'document'
             };
             setUploadedFiles(prevFiles => [...prevFiles, newFile]);
             const reader = new FileReader();
-            console.log("DEBUG: handleDocumentFileChange - Reading file:", file.name);
-            reader.onload = (event) => {
-                const content = event.target.result;
-                const cleanContent = content.replace(/[\u0000-\u001F\u007F-\u009F]/g, ''); // Removes non-printable
+            
+            console.log("DEBUG: handleDocumentFileChange - Reading file:", file.name, "Type:", file.type);
 
-                // You can now use `content` as plain text, e.g., set it in a textarea
-                console.log("Selected document file content:", cleanContent);
-                setAdoContent(cleanContent); // ⬅️ if you want to prefill user story input
-                
-                sourcePrimaryText = cleanContent;
-                sourceOtherText = otherRequirementsText;
-                if (!primaryRequirementsText.trim()) { // Check for general section's primary input
-                    openModal('Please enter content for "Primary Requirement Details" in the General section.', 'info');
-                    return;
+            reader.onload = async (event) => {
+                try {
+                    let content;
+
+                    if (file.type.includes('msword') || file.type.includes('openxmlformats')) {
+                        // Word documents are read as ArrayBuffer with options to preserve styles
+                        const result = await mammoth.extractRawText({
+                            arrayBuffer: event.target.result,
+                            styleMap: [
+                                "p[style-name='Heading 1'] => h1:fresh",
+                                "p[style-name='Heading 2'] => h2:fresh",
+                                "p[style-name='Heading 3'] => h3:fresh"
+                            ]
+                        });
+                        content = result.value;
+                    } else {
+                        // For text files, we need to decode the ArrayBuffer to text
+                        content = new TextDecoder().decode(event.target.result);
+                    }
+
+                    // Clean and normalize the content
+                    let cleanContent = content
+                        .replace(/^\uFEFF/, '') // Remove BOM if present
+                        .replace(/\r\n/g, '\n') // Normalize line endings
+                        .replace(/[\u0000-\u0008\u000B-\u000C\u000E-\u001F\u007F-\u009F]/g, '') // Remove control characters but keep tabs and newlines
+                        .replace(/([.!?])-/g, '$1\n-') // Add line break before bullet points
+                        .replace(/(\d\.)/g, '\n$1') // Add line break before numbered points
+                        .replace(/\s*-\s*/g, '\n- ') // Normalize bullet points
+                        .replace(/\n{3,}/g, '\n\n') // Normalize multiple line breaks
+                        .trim(); // Remove leading/trailing whitespace
+
+                    // Parse and distribute content to appropriate fields
+                    const lines = cleanContent.split('\n');
+                    let primaryContent = '';
+                    let otherContent = '';
+                    let currentSection = '';
+                    let currentSubsection = '';
+                    let indentationLevel = 0;
+
+                    // Helper function to detect section headers and their importance
+                    const detectSection = (line) => {
+                        // Check if line starts with h1/h2/h3 tags (from Word document headers)
+                        const headingMatch = line.match(/^<(h[1-3])>(.*?)<\/\1>$/);
+                        if (headingMatch) {
+                            const headingContent = headingMatch[2].trim();
+                            // Skip known headers based on heading level and content
+                            if (headingMatch[1] === 'h1' && /^Test Case Generator/i.test(headingContent)) {
+                                return null;
+                            }
+                        }
+
+                        const headerPatterns = {
+                            primary: /^(?:Primary |Business |Core |Main )?Requirements?(?: Details)?|User Stories?|Features?|Specifications?$/i,
+                            other: /^(?:Other |Additional |Related )?(?:Details|Context|Information|References?)$/i
+                        };
+
+                        const trimmedLine = line.replace(/<[^>]+>/g, '').trim(); // Remove HTML tags for checking
+                        
+                        // Check for primary section headers
+                        if (headerPatterns.primary.test(trimmedLine)) {
+                            return 'primary';
+                        }
+                        // Check for other/context section headers
+                        if (headerPatterns.other.test(trimmedLine)) {
+                            return 'other';
+                        }
+                        return null;
+                    };
+
+                    // Helper function to detect subsections
+                    const detectSubsection = (line) => {
+                        const subsectionPatterns = {
+                            acceptanceCriteria: /^(?:Acceptance Criteria|AC|Acceptance Tests?)(?:\:|\s*$)/i,
+                            testScenarios: /^(?:Test Scenarios?|Test Cases?)(?:\:|\s*$)/i,
+                            businessRules: /^(?:Business Rules?|Rules?)(?:\:|\s*$)/i,
+                            linkedItems: /^(?:Linked |Related |Associated )(?:Items?|Stories?|Epics?)(?:\:|\s*$)/i
+                        };
+
+                        for (const [key, pattern] of Object.entries(subsectionPatterns)) {
+                            if (pattern.test(line.trim())) {
+                                return key;
+                            }
+                        }
+                        return null;
+                    };
+
+                    // Process each line
+                    for (const line of lines) {
+                        const trimmedLine = line.trim();
+                        
+                        // Skip empty lines and handle line continuations
+                        if (!trimmedLine) {
+                            if (currentSection) {
+                                // Add line break to maintain paragraph structure
+                                if (currentSection === 'primary') {
+                                    primaryContent += '\n';
+                                } else if (currentSection === 'other') {
+                                    otherContent += '\n';
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Skip common document titles and headers based on content or HTML tags
+                        if (/^(?:<h1>)?Test Case Generator|Requirements Document|Input(?:<\/h1>)?\s*$/i.test(trimmedLine)) {
+                            continue;
+                        }
+
+                        // Check for section headers and set current section
+                        if (/^Other Related Details\s*\/?\s*Context/i.test(trimmedLine)) {
+                            currentSection = 'other';
+                            continue;
+                        } else if (/^Primary Requirement Details/i.test(trimmedLine)) {
+                            currentSection = 'primary';
+                            continue;
+                        }
+
+                        // Detect section changes
+                        const detectedSection = detectSection(trimmedLine);
+                        if (detectedSection) {
+                            currentSection = detectedSection;
+                            currentSubsection = '';
+                            continue;
+                        }
+
+                        // Detect subsection changes
+                        const detectedSubsection = detectSubsection(trimmedLine);
+                        if (detectedSubsection) {
+                            currentSubsection = detectedSubsection;
+                            // Add subsection header
+                            const content = currentSection === 'primary' ? primaryContent : otherContent;
+                            const header = content ? '\n\n' + trimmedLine : trimmedLine;
+                            if (currentSection === 'primary') {
+                                primaryContent += header;
+                            } else if (currentSection === 'other') {
+                                otherContent += header;
+                            }
+                            continue;
+                        }
+
+                        // Handle bullet points and numbered lists
+                        const bulletMatch = trimmedLine.match(/^(\s*)([-•*]|\d+\.)\s+(.+)$/);
+                        if (bulletMatch) {
+                            const [, indent, bullet, text] = bulletMatch;
+                            const formattedLine = `${indent}${bullet} ${text}`;
+                            if (currentSection === 'primary') {
+                                primaryContent += (primaryContent ? '\n' : '') + formattedLine;
+                            } else if (currentSection === 'other') {
+                                otherContent += (otherContent ? '\n' : '') + formattedLine;
+                            }
+                            continue;
+                        }
+
+                        // Add content to appropriate section with proper formatting
+                        if (currentSection === 'other') {
+                            // For the "Other Related Details / Context" section
+                            // Check for different types of content and format accordingly
+                            if (trimmedLine.startsWith('Linked Epic:') || trimmedLine.startsWith('Linked Stories:')) {
+                                // Add linked items with proper spacing
+                                otherContent += (otherContent ? '\n' : '') + trimmedLine;
+                            } else if (trimmedLine.startsWith('Acceptance Criteria:')) {
+                                // Start Acceptance Criteria on new line with spacing
+                                otherContent += (otherContent ? '\n\n' : '') + 'Acceptance Criteria:\n';
+                            } else if (/^\d+\.\s/.test(trimmedLine) || /^[-•*]\s/.test(trimmedLine)) {
+                                // For numbered lists or bullet points, maintain proper indentation
+                                otherContent += trimmedLine + '\n';
+                            } else {
+                                // Regular content
+                                otherContent += (otherContent ? '\n' : '') + trimmedLine;
+                            }
+                        } else if (currentSection === 'primary' || !currentSection) {
+                            // For the Primary Requirements section
+                            if (/^[-•*]\s/.test(trimmedLine)) {
+                                // Handle bullet points with proper spacing
+                                primaryContent += (primaryContent ? '\n' : '') + trimmedLine;
+                            } else {
+                                // Regular content
+                                primaryContent += (primaryContent ? '\n' : '') + trimmedLine;
+                            }
+                        }
+                    }
+
+                    // Set the content to the appropriate textarea based on active section
+                    if (activeSection === 'general') {
+                        setPrimaryRequirementsText(primaryContent.trim());
+                        setOtherRequirementsText(otherContent.trim());
+                    } else if (activeSection === 'ado') {
+                        setAdoContent(primaryContent.trim());
+                    }
+                    
+                    console.log("Document file content processed successfully");
+                    openModal('Document uploaded successfully. Click "Generate Test Cases" when ready.', 'info');
+                } catch (error) {
+                    console.error('Error processing file:', error);
+                    openModal('Error processing file. Please ensure it is a valid text document.', 'info');
                 }
             };
-            const cleanedPrimaryText = activeSection === 'general' ? stripHtmlTags(sourcePrimaryText) : sourcePrimaryText;
-            const cleanedOtherText = activeSection === 'general' ? stripHtmlTags(sourceOtherText) : sourceOtherText;
-            try {
-                const agentEndpoint = import.meta.env.VITE_AGENT_ENDPOINT;            
-                const apiKey = import.meta.env.VITE_API_KEY;
-                
-                currentPromptContent += "PRIMARY REQUIREMENT DETAILS:\n";
-                currentPromptContent += cleanedPrimaryText + "\n\n";
-
-                if (cleanedOtherText.trim()) {
-                    currentPromptContent += "OTHER RELATED DETAILS / CONTEXT:\n";
-                    currentPromptContent += cleanedOtherText + "\n\n";
-                }
-
-                // MODIFIED PROMPT: Explicitly ask AI to include "Generated by AI" in Comments
-                currentPromptContent += `Please generate a JSON array of test cases based on these details. Each test case should have the following fields: ID (string) (example: X-001, X-002), Title (string), TestSteps (single string with steps like '1. Step Action:::EXPECTED_RESULT:::Expected Result Text 2. Another Step:::EXPECTED_RESULT:::Another Expected Result Text' - ensure this is PLAIN TEXT with no HTML tags, ready for XML embedding), TestData (string), State (e.g., 'Design'), Priority (1-4), AreaPath (string, e.g., '${project}\\Features\\UserStorySpecificArea' or '${project}\\DefaultArea'), AutomationStatus (string), Tags (e.g., 'UI; Functional'), Description (string), Preconditions (string), Postconditions (string), Comments (string). Ensure 'TestSteps' is a single string that I can can parse into an array later. Focus on functional and edge cases for the PRIMARY REQUIREMENT, and return the response in **JSON format**."`;
-                
-                //console.log("DEBUG: Final promptContent sent to AI Agent:", currentPromptContent);
-
-                const requestBody = {
-                    messages: [
-                        { "role": "user", "content": currentPromptContent }
-                    ],
-                    max_tokens: 10000,
-                    temperature: 0.7,
-                    response_format: { "type": "json_object" }
-                };
-
-                const agentResponse = await fetch(agentEndpoint, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'api-key': apiKey
-                    },
-                    body: JSON.stringify(requestBody)
-                });
-
-                if (!agentResponse.ok) {
-                    const errorData = await agentResponse.text();
-                    throw new Error(`Agent API Error: ${agentResponse.status} - ${agentResponse.statusText} - ${errorData}`);
-                }
-
-                const result = await agentResponse.json();
-                
-                const messageContent = result.choices && result.choices.length > 0 && result.choices[0].message && result.choices[0].message.content
-                    ? result.choices[0].message.content
-                    : JSON.stringify(result, null, 2);
-                setRawAgentResponseString(messageContent);
-
-                let generated = [];
-                if (result && result.choices && result.choices.length > 0 && result.choices[0].message && result.choices[0].message.content) {
-                    try {
-                        let parsedTestCases = JSON.parse(result.choices[0].message.content);
-                        if (parsedTestCases && typeof parsedTestCases === 'object' && Array.isArray(parsedTestCases.testCases)) {
-                            parsedTestCases = parsedTestCases.testCases;
-                        }
-                        
-                        if (Array.isArray(parsedTestCases)) {
-                            generated = parsedTestCases.map(tc => {
-                                let combinedDescription = tc.Description || 'N/A';
-                                let aiCommentsForHistory = tc.Comments || 'N/A'; // Store AI's raw comments for history
-
-                                // Append AI's comments to description if they exist and are not just "N/A"
-                                if (aiCommentsForHistory && aiCommentsForHistory.trim() !== 'N/A') {
-                                    combinedDescription += '\n\nAI Insights/Comments:\n' + stripHtmlTags(aiCommentsForHistory);
-                                }
-
-                                return {
-                                    ...tc,
-                                    Description: combinedDescription, // This will be sent to System.Description
-                                    steps: parseTestSteps(tc.TestSteps || ''),
-                                    aiCommentsForHistory: aiCommentsForHistory, // Original AI comments for System.History
-                                    Comments: "Test Case Generated by AI", // This is what shows in the UI table
-                                    isInactive: false
-                                };
-                            });
-                        } else {
-                            throw new Error("Parsed JSON is not an array of test cases.");
-                        }
-                    } catch (jsonParseError) {
-                        throw new Error(`Failed to parse AI agent's JSON response: ${jsonParseError.message}. Raw content: ${result.choices[0].message.content}`);
-                    }
-                } else {
-                    throw new Error("Agent response structure is unexpected or content is missing.");
-                }
-                setGeneratedTestCases(generated);
-                
-                openModal('Test cases generated successfully!', 'info');
-
-            } catch (error) {
-                console.error("Error generating test cases:", error);
-                setGenerationError('Failed to generate test cases: ' + error.message);
-                openModal(`Failed to generate test cases: ${error.message}`, 'info');
-            } finally {
-                setGeneratingTestCases(false);
-            }
-            // reader.readAsText(file);
-            // openModal(`Document selected: ${file.name}. Content processing done`);
-            // console.log("Selected document file:", file);
+            // Always read as ArrayBuffer since it works for both text and Word documents
+            reader.readAsArrayBuffer(file);
+            // Reset the input value to allow selecting the same file again if needed
+            event.target.value = null;
         }
         // Reset the input value to allow selecting the same file again if needed
         event.target.value = null;

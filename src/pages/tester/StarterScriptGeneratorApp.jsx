@@ -38,6 +38,9 @@ const StarterScriptGeneratorApp = () => {
     // State to store the uploaded image data (base64) and name (now an array)
     const [uploadedImageFiles, setUploadedImageFiles] = useState([]); // Array of { id: string, name: string, content: string }
 
+    // State to control the visibility of file upload buttons
+    const [isHiding, setIsHiding] = useState(false); // Changed to false to show the buttons
+
     // Ref for file input elements to clear their value
     const htmlInputRef = useRef(null);
     const imageInputRef = useRef(null);
@@ -127,7 +130,6 @@ const StarterScriptGeneratorApp = () => {
 
     // State to indicate if the agent is currently processing a request
     const [isProcessing, setIsProcessing] = useState(false);
-    const isHiding = useState(true); // State to control visibility of the file upload buttons
 
     // Ref for the messages container to enable auto-scrolling
     const messagesEndRef = useRef(null);
